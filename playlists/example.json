@@ -1,0 +1,10 @@
+{
+  "title": "Example: modern C++ JSON and concurrency",
+  "description": "Example spec for ytpl. Copy it and replace the videos with your own.",
+  "privacy": "private",
+  "videos": [
+    {"id": "Sa8bdVogGIo", "note": "nlohmann/json in 15 minutes"},
+    {"id": "5oOrRLa2XCE", "note": "libcurl + nlohmann/json"},
+    {"id": "13dFggo4t_I", "note": "Condition variables"}
+  ]
+}

@@ -1,0 +1,11 @@
+# secrets
+.env
+client_secret*.json
+.token.json
+
+# personal playlist specs stay local; only the example is published
+playlists/*
+!playlists/example.json
+
+__pycache__/
+.DS_Store
