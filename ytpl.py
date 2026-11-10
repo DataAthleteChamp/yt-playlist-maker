@@ -2,8 +2,9 @@
 """ytpl: make YouTube playlists from the command line. Agent-friendly, stdlib only.
 
 Read-only commands (info, search, anon) only need YOUTUBE_API_KEY in .env.
-Creating playlists in your account (create, add, mine) needs a one-time Google
-login (`python3 ytpl.py auth`), because YouTube does not let API keys write.
+Saving playlists to your account (create, add, mine) needs a one-time Google
+login, because YouTube does not let API keys write. Run `python3 ytpl.py setup`
+once and it walks you through it.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import time
 import urllib.error
@@ -27,12 +29,27 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 TOKEN_FILE = ROOT / ".token.json"
 CLIENT_FILE = ROOT / "client_secret.json"
+DOWNLOADS = Path.home() / "Downloads"
 
 API = "https://www.googleapis.com/youtube/v3"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPE = "https://www.googleapis.com/auth/youtube"
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+TEST_USERS_URL = "https://console.cloud.google.com/auth/audience"
+
+SETUP_STEPS = [
+    ("Turn on YouTube Data API v3: click Enable (if the button says Manage, it is already on).",
+     "https://console.cloud.google.com/apis/library/youtube.googleapis.com"),
+    ("Set up Google Auth Platform: click Get started, enter any app name (for example ytpl) and your "
+     "email, choose Audience: External, then Create.",
+     "https://console.cloud.google.com/auth/overview"),
+    ("Add yourself as a test user: Audience, then Test users, then Add users, enter your Gmail, then Save.",
+     TEST_USERS_URL),
+    ("Create the client: Clients, then Create client, Application type: Desktop app, then Create, then "
+     "Download JSON in the dialog that appears.",
+     "https://console.cloud.google.com/auth/clients"),
+]
 
 
 class CliError(Exception):
@@ -225,23 +242,44 @@ def cmd_anon(args) -> None:
     if len(ids) > 50:
         raise CliError("an instant (no-login) playlist holds at most 50 videos")
     print("https://www.youtube.com/watch_videos?video_ids=" + ",".join(ids))
-    print("Temporary playlist, no login needed. For a permanent one in your account: "
-          "`create` (after the one-time `auth`).", file=sys.stderr)
+    print("This is a temporary playlist and is NOT saved to your account. To save playlists to your "
+          "account, run `python3 ytpl.py setup` once, then use `create`.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- login (OAuth, installed-app + PKCE)
 
+def client_file() -> Path | None:
+    """The OAuth client JSON in this folder, if any (Google names downloads client_secret_<id>.json)."""
+    if CLIENT_FILE.exists():
+        return CLIENT_FILE
+    found = sorted(ROOT.glob("client_secret*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return found[0] if found else None
+
+
+def read_client(path: Path) -> tuple[str, str]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise CliError(f"can't read {path.name}: {exc}") from None
+    if not isinstance(data, dict) or "installed" not in data:
+        kind = next(iter(data), "unknown") if isinstance(data, dict) else "unknown"
+        raise CliError(f"{path.name} is a '{kind}' client, but a 'Desktop app' client is needed "
+                       "(Google Auth Platform: Clients, then Create client, then Desktop app)")
+    block = data["installed"]
+    if not block.get("client_id") or not block.get("client_secret"):
+        raise CliError(f"{path.name} is missing client_id or client_secret")
+    return block["client_id"], block["client_secret"]
+
+
 def oauth_client() -> tuple[str, str]:
+    path = client_file()
+    if path:
+        return read_client(path)
     cid = os.environ.get("GOOGLE_CLIENT_ID", "")
     secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-    if CLIENT_FILE.exists():
-        block = json.loads(CLIENT_FILE.read_text())
-        block = block.get("installed") or block.get("web") or {}
-        cid, secret = block.get("client_id", cid), block.get("client_secret", secret)
-    if not cid or not secret:
-        raise CliError(f"no OAuth client: save the Desktop-app client JSON as {CLIENT_FILE.name} "
-                       "(README.md, 'One-time login setup')")
-    return cid, secret
+    if cid and secret:
+        return cid, secret
+    raise CliError("no Google login client yet: run `python3 ytpl.py setup` once (about 5 minutes)")
 
 
 def save_token(fresh: dict, old: dict | None = None) -> dict:
@@ -254,12 +292,12 @@ def save_token(fresh: dict, old: dict | None = None) -> dict:
 
 def access_token() -> str:
     if not TOKEN_FILE.exists():
-        raise CliError("not logged in: run `python3 ytpl.py auth` once (see README.md)")
+        raise CliError("not logged in to YouTube yet: run `python3 ytpl.py setup` once")
     tok = json.loads(TOKEN_FILE.read_text())
     if tok.get("expires_at", 0) - 60 > time.time():
         return tok["access_token"]
     if not tok.get("refresh_token"):
-        raise CliError("login expired: run `python3 ytpl.py auth` again")
+        raise CliError("login expired: run `python3 ytpl.py auth`")
     cid, secret = oauth_client()
     try:
         fresh = request_json("POST", TOKEN_URL, form={
@@ -269,8 +307,8 @@ def access_token() -> str:
             "grant_type": "refresh_token",
         })
     except CliError as exc:
-        raise CliError(f"{exc}\nlogin expired (apps in Testing mode expire after 7 days): "
-                       "run `python3 ytpl.py auth` again") from None
+        raise CliError(f"{exc}\nyour login expired (apps in Testing mode expire after 7 days): "
+                       "run `python3 ytpl.py auth`") from None
     return save_token(fresh, tok)["access_token"]
 
 
@@ -314,14 +352,18 @@ def cmd_auth(args) -> None:
         "code_challenge_method": "S256",
         "state": state,
     })
-    print("Opening your browser for Google login. If it doesn't open, visit:\n" + url)
+    print("Opening Google login in your browser. Google may warn that the app isn't verified; "
+          "it is your own app, so click Continue, then allow YouTube access.")
+    print("If the browser doesn't open, visit:\n" + url)
     webbrowser.open(url)
     deadline = time.time() + 300
     while not result and time.time() < deadline:
         server.handle_request()
     server.server_close()
     if "code" not in result:
-        raise CliError(f"login not completed: {result.get('error', 'timed out after 5 minutes')}")
+        error = result.get("error", "timed out after 5 minutes")
+        raise CliError(f"login not completed ({error}). If Google said 'Access blocked', add your Google "
+                       f"account as a test user at {TEST_USERS_URL}, then run `python3 ytpl.py auth`.")
     if result.get("state") != state:
         raise CliError("login state mismatch, aborting")
     save_token(request_json("POST", TOKEN_URL, form={
@@ -332,10 +374,89 @@ def cmd_auth(args) -> None:
         "grant_type": "authorization_code",
         "code_verifier": verifier,
     }))
-    print(f"Logged in. Saved {TOKEN_FILE.name}; create/add/mine now work.")
+    print(f"Logged in. Saved {TOKEN_FILE.name}; create, add and mine now work.")
+
+
+def find_client() -> Path | None:
+    """A client JSON in this folder, or the newest one in ~/Downloads."""
+    path = client_file()
+    if path:
+        return path
+    if DOWNLOADS.is_dir():
+        downloads = list(DOWNLOADS.glob("client_secret*.json"))
+        if downloads:
+            return max(downloads, key=lambda p: p.stat().st_mtime)
+    return None
+
+
+def cmd_setup(args) -> None:
+    if not os.environ.get("YOUTUBE_API_KEY"):
+        print(f"note: no YOUTUBE_API_KEY in {ENV_FILE.name}. info and search need it; saving playlists doesn't.")
+    if TOKEN_FILE.exists() and not args.force:
+        try:
+            count = len(my_playlists(access_token()))
+            print(f"Already set up: logged in, {count} playlists in your account. Use --force to redo it.")
+            return
+        except CliError as exc:
+            print(f"The saved login no longer works ({exc}). Setting up again.")
+    source = find_client()
+    if source is None:
+        print("One-time setup: create your own Google login client (about 5 minutes).")
+        print("Use the same Google Cloud project as your API key (project picker at the top of each page).\n")
+        for n, (text, url) in enumerate(SETUP_STEPS, 1):
+            print(f"{n}. {text}\n   {url}")
+        if not args.no_browser:
+            for _, url in SETUP_STEPS:
+                webbrowser.open(url)
+        wait = f"{args.wait // 60} min" if args.wait >= 60 else f"{args.wait} s"
+        print(f"\nWaiting up to {wait} for client_secret_*.json in {DOWNLOADS} "
+              "(or in this folder). Press Ctrl+C to stop.", flush=True)
+        deadline = time.time() + args.wait
+        while source is None and time.time() < deadline:
+            time.sleep(2)
+            source = find_client()
+        if source is None:
+            raise CliError("no client file appeared; finish the steps above, then run setup again")
+    read_client(source)  # validate before moving it into place
+    if source != CLIENT_FILE:
+        shutil.move(str(source), CLIENT_FILE)
+        CLIENT_FILE.chmod(0o600)
+        print(f"Moved {source.name} here as {CLIENT_FILE.name} (private, git-ignored).")
+    cmd_auth(args)
+    count = len(my_playlists(access_token()))
+    print(f"All set: logged in, {count} playlists in your account. "
+          "Next: python3 ytpl.py create --spec playlists/<name>.json")
 
 
 # ---------------------------------------------------------------- write (needs login)
+
+def my_playlists(token: str) -> list[dict]:
+    items: list[dict] = []
+    page = None
+    while True:
+        params = {"part": "snippet,contentDetails,status", "mine": "true", "maxResults": 50}
+        if page:
+            params["pageToken"] = page
+        data = request_json("GET", f"{API}/playlists", params=params, token=token)
+        items += data.get("items", [])
+        page = data.get("nextPageToken")
+        if not page:
+            return items
+
+
+def playlist_video_ids(token: str, pid: str) -> set[str]:
+    ids: set[str] = set()
+    page = None
+    while True:
+        params = {"part": "contentDetails", "playlistId": pid, "maxResults": 50}
+        if page:
+            params["pageToken"] = page
+        data = request_json("GET", f"{API}/playlistItems", params=params, token=token)
+        ids.update(item["contentDetails"]["videoId"] for item in data.get("items", []))
+        page = data.get("nextPageToken")
+        if not page:
+            return ids
+
 
 def insert_item(token: str, pid: str, vid: str) -> None:
     body = {"snippet": {"playlistId": pid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}
@@ -349,9 +470,21 @@ def insert_item(token: str, pid: str, vid: str) -> None:
             time.sleep(1.5 * (attempt + 1))
 
 
+def add_videos(token: str, pid: str, ids: list[str]) -> list[str]:
+    failed = []
+    for n, vid in enumerate(ids, 1):
+        try:
+            insert_item(token, pid, vid)
+            print(f"  [{n}/{len(ids)}] added {vid}")
+        except CliError as exc:
+            failed.append(vid)
+            print(f"  [{n}/{len(ids)}] FAILED {vid}: {exc}", file=sys.stderr)
+    return failed
+
+
 def cmd_create(args) -> None:
     ids, spec = collect(args)
-    title = args.title or spec.get("title")
+    title = (args.title or spec.get("title") or "").strip()
     if not title:
         raise CliError("playlist needs a title: --title or 'title' in the spec")
     description = args.description if args.description is not None else spec.get("description", "")
@@ -362,44 +495,45 @@ def cmd_create(args) -> None:
         if missing:
             print("skipping unavailable videos: " + ", ".join(missing), file=sys.stderr)
             ids = [v for v in ids if v in found]
-    print(f"Playlist '{title}' ({privacy}), {len(ids)} videos, ~{50 + 50 * len(ids)} quota units")
     if args.dry_run:
+        print(f"Would save '{title}' ({privacy}) with {len(ids)} videos, ~{50 + 50 * len(ids)} quota units")
         print_videos(ids, found) if found else print("\n".join(ids))
         return
     token = access_token()
-    playlist = request_json("POST", f"{API}/playlists", params={"part": "snippet,status"}, token=token, body={
-        "snippet": {"title": title[:150], "description": description[:5000]},
-        "status": {"privacyStatus": privacy},
-    })
-    pid = playlist["id"]
-    failed = []
-    for n, vid in enumerate(ids, 1):
-        try:
-            insert_item(token, pid, vid)
-            print(f"  [{n}/{len(ids)}] added {vid}")
-        except CliError as exc:
-            failed.append(vid)
-            print(f"  [{n}/{len(ids)}] FAILED {vid}: {exc}", file=sys.stderr)
+    wanted = title.lower()
+    existing = None if args.new else next(
+        (p for p in my_playlists(token) if p["snippet"]["title"].strip().lower() == wanted), None)
+    if existing:
+        pid = existing["id"]
+        have = playlist_video_ids(token, pid)
+        todo = [v for v in ids if v not in have]
+        print(f"Updating your existing playlist '{existing['snippet']['title']}': "
+              f"{len(have)} videos there, adding {len(todo)}.")
+    else:
+        playlist = request_json("POST", f"{API}/playlists", params={"part": "snippet,status"}, token=token, body={
+            "snippet": {"title": title[:150], "description": description[:5000]},
+            "status": {"privacyStatus": privacy},
+        })
+        pid, todo = playlist["id"], ids
+        print(f"Created playlist '{title}' ({privacy}). Adding {len(todo)} videos.")
+    failed = add_videos(token, pid, todo)
     print(f"https://www.youtube.com/playlist?list={pid}")
     if failed:
-        raise CliError(f"{len(failed)} video(s) not added: {', '.join(failed)}")
+        raise CliError(f"{len(failed)} video(s) not added: {', '.join(failed)}. Run the same command again to retry.")
 
 
 def cmd_add(args) -> None:
     ids, _ = collect(args)
     token = access_token()
     pid = playlist_id(args.playlist)
-    for n, vid in enumerate(ids, 1):
-        insert_item(token, pid, vid)
-        print(f"  [{n}/{len(ids)}] added {vid}")
+    failed = add_videos(token, pid, ids)
     print(f"https://www.youtube.com/playlist?list={pid}")
+    if failed:
+        raise CliError(f"{len(failed)} video(s) not added: {', '.join(failed)}")
 
 
 def cmd_mine(args) -> None:
-    data = request_json("GET", f"{API}/playlists", token=access_token(), params={
-        "part": "snippet,contentDetails,status", "mine": "true", "maxResults": 50,
-    })
-    for p in data.get("items", []):
+    for p in my_playlists(access_token()):
         print(f"{p['id']}  {p['contentDetails']['itemCount']:>3} videos  "
               f"{p['status']['privacyStatus']:<8}  {p['snippet']['title']}")
 
@@ -407,7 +541,8 @@ def cmd_mine(args) -> None:
 # ---------------------------------------------------------------- CLI
 
 def main(argv: list[str] | None = None) -> int:
-    sys.stdout.reconfigure(line_buffering=True)  # keep stdout/stderr in order when piped to an agent
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)  # keep stdout/stderr in order when piped to an agent
     load_env()
     parser = argparse.ArgumentParser(prog="ytpl", description="Make YouTube playlists (agent-friendly).")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -426,13 +561,21 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--lang", default="en")
     sp.set_defaults(fn=cmd_search)
 
-    videos_cmd("anon", "instant temporary playlist link, no login (max 50)").set_defaults(fn=cmd_anon)
-    sub.add_parser("auth", help="one-time Google login so create/add/mine work").set_defaults(fn=cmd_auth)
+    videos_cmd("anon", "temporary playlist link, NOT saved to your account (max 50)").set_defaults(fn=cmd_anon)
 
-    sp = videos_cmd("create", "create a playlist in your account (login; 50 units + 50 per video)")
+    sp = sub.add_parser("setup", help="one-time guided setup so playlists save to your account")
+    sp.add_argument("--wait", type=int, default=900, help="seconds to wait for the downloaded client file")
+    sp.add_argument("--no-browser", action="store_true", help="print the setup links instead of opening them")
+    sp.add_argument("--force", action="store_true", help="redo setup even if already logged in")
+    sp.set_defaults(fn=cmd_setup)
+
+    sub.add_parser("auth", help="log in again (for example after the 7-day expiry)").set_defaults(fn=cmd_auth)
+
+    sp = videos_cmd("create", "save a playlist to your account; reuses one with the same title")
     sp.add_argument("--title")
     sp.add_argument("--description")
     sp.add_argument("--privacy", choices=["private", "unlisted", "public"])
+    sp.add_argument("--new", action="store_true", help="always create a new playlist, even if the title exists")
     sp.add_argument("--dry-run", action="store_true", help="validate and show, don't create")
     sp.set_defaults(fn=cmd_create)
 
